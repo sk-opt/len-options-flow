@@ -207,6 +207,12 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
         return output
 
 
+def _strip_provider(model: str) -> str:
+    """Strip a LiteLLM provider prefix (e.g. 'openai/') when a custom
+    base_url is used, so the model name is sent verbatim to that endpoint."""
+    return model.split("/", 1)[-1] if "/" in model else model
+
+
 def _env(key: str, fallback: str | None = None) -> str:
     """Read an env var, exiting with a clear message if missing."""
     val = os.getenv(key, fallback)
@@ -218,13 +224,15 @@ def _env(key: str, fallback: str | None = None) -> str:
 
 def main():
     # ---- per-agent model config with fallback chain ----
-    analyst_model = os.getenv("ANALYST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    analyst_model_raw = os.getenv("ANALYST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
     analyst_key   = os.getenv("ANALYST_API_KEY") or _env("OPENAI_API_KEY")
     analyst_base  = os.getenv("ANALYST_BASE_URL") or None
+    analyst_model = _strip_provider(analyst_model_raw) if analyst_base else analyst_model_raw
 
-    reviewer_model = os.getenv("REVIEWER_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    reviewer_model_raw = os.getenv("REVIEWER_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
     reviewer_key   = os.getenv("REVIEWER_API_KEY") or _env("OPENAI_API_KEY")
     reviewer_base  = os.getenv("REVIEWER_BASE_URL") or None
+    reviewer_model = _strip_provider(reviewer_model_raw) if reviewer_base else reviewer_model_raw
 
     analyst_llm  = LLM(model=analyst_model, api_key=analyst_key, base_url=analyst_base)
     reviewer_llm = LLM(model=reviewer_model, api_key=reviewer_key, base_url=reviewer_base)
