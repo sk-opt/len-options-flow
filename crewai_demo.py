@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 
-from crewai import Agent, Task, Crew
+from crewai import Agent, Task, Crew, LLM
 from crewai.flow import Flow, listen, or_, start, router
 from pydantic import BaseModel
 
@@ -23,8 +23,9 @@ class OptionsFlowState(BaseModel):
     feedback: str = ""
 
 
-def _make_analyst(framework: str) -> Agent:
+def _make_analyst(framework: str, llm: LLM) -> Agent:
     return Agent(
+        llm=llm,
         role="Senior Options Flow Research Analyst",
         goal=(
             "Analyse the attached CSV of unusual options OI/volume data for LEN "
@@ -41,8 +42,9 @@ def _make_analyst(framework: str) -> Agent:
     )
 
 
-def _make_reviewer() -> Agent:
+def _make_reviewer(llm: LLM) -> Agent:
     return Agent(
+        llm=llm,
         role="Senior Options Flow Quality Reviewer",
         goal=(
             "Verify the Research Analyst's report for factual accuracy against the "
@@ -69,10 +71,14 @@ def _make_reviewer() -> Agent:
 
 class OptionsFlowAnalysis(Flow[OptionsFlowState]):
 
-    def __init__(self, csv_data: str, framework: str, max_retries: int = MAX_RETRIES):
+    def __init__(self, csv_data: str, framework: str,
+                 analyst_llm: LLM, reviewer_llm: LLM,
+                 max_retries: int = MAX_RETRIES):
         super().__init__()
         self.csv_data = csv_data
         self.framework = framework
+        self.analyst_llm = analyst_llm
+        self.reviewer_llm = reviewer_llm
         self.max_retries = max_retries
 
     # --------------------------------------------------------------
@@ -80,7 +86,7 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # --------------------------------------------------------------
     @start()
     def research_phase(self):
-        analyst = _make_analyst(self.framework)
+        analyst = _make_analyst(self.framework, self.analyst_llm)
         task = Task(
             description=(
                 f"Produce a thorough options flow analysis for LEN based on the following CSV data.\n\n"
@@ -110,7 +116,7 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # --------------------------------------------------------------
     @listen(or_("research_phase", "revise_phase"))
     def review_phase(self):
-        reviewer = _make_reviewer()
+        reviewer = _make_reviewer(self.reviewer_llm)
         feedback_hint = (
             f"\n--- PREVIOUS FEEDBACK (verify these were fixed) ---\n"
             f"{self.state.feedback}\n--- END ---\n"
@@ -168,7 +174,7 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # --------------------------------------------------------------
     @listen("revise")
     def revise_phase(self):
-        analyst = _make_analyst(self.framework)
+        analyst = _make_analyst(self.framework, self.analyst_llm)
         task = Task(
             description=(
                 f"Revise your previous options flow analysis for LEN based on the "
@@ -201,16 +207,37 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
         return output
 
 
-def main():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY environment variable not set.", file=sys.stderr)
+def _env(key: str, fallback: str | None = None) -> str:
+    """Read an env var, exiting with a clear message if missing."""
+    val = os.getenv(key, fallback)
+    if val is None:
+        print(f"ERROR: environment variable {key} is not set.", file=sys.stderr)
         sys.exit(1)
+    return val
+
+
+def main():
+    # ---- per-agent model config with fallback chain ----
+    analyst_model = os.getenv("ANALYST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    analyst_key   = os.getenv("ANALYST_API_KEY") or _env("OPENAI_API_KEY")
+    analyst_base  = os.getenv("ANALYST_BASE_URL") or None
+
+    reviewer_model = os.getenv("REVIEWER_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    reviewer_key   = os.getenv("REVIEWER_API_KEY") or _env("OPENAI_API_KEY")
+    reviewer_base  = os.getenv("REVIEWER_BASE_URL") or None
+
+    analyst_llm  = LLM(model=analyst_model, api_key=analyst_key, base_url=analyst_base)
+    reviewer_llm = LLM(model=reviewer_model, api_key=reviewer_key, base_url=reviewer_base)
 
     csv_data = load_text(CSV_PATH)
     framework = load_text(MD_PATH)
 
-    flow = OptionsFlowAnalysis(csv_data=csv_data, framework=framework)
+    flow = OptionsFlowAnalysis(
+        csv_data=csv_data,
+        framework=framework,
+        analyst_llm=analyst_llm,
+        reviewer_llm=reviewer_llm,
+    )
     flow.kickoff()
 
 
