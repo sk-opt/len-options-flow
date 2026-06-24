@@ -2,30 +2,29 @@ import os
 import sys
 from pathlib import Path
 
-from crewai import Agent, Task, Crew, Process
+from crewai import Agent, Task, Crew
+from crewai.flow import Flow, listen, or_, start, router
+from pydantic import BaseModel
 
 
 CSV_PATH = Path(r"C:\Users\WDAGUtilityAccount\Desktop\Downloads\Options_Unusual_OI_LEN_20260624.csv")
 MD_PATH  = Path(r"C:\Users\WDAGUtilityAccount\Desktop\Downloads\OptionsFlow.md")
+MAX_RETRIES = 2
 
 
 def load_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def main():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
+class OptionsFlowState(BaseModel):
+    report: str = ""
+    review: str = ""
+    retries: int = 0
+    feedback: str = ""
 
-    csv_data = load_text(CSV_PATH)
-    framework = load_text(MD_PATH)
 
-    # ------------------------------------------------------------------
-    # Agent 1 – Research Analyst
-    # ------------------------------------------------------------------
-    research_analyst = Agent(
+def _make_analyst(framework: str) -> Agent:
+    return Agent(
         role="Senior Options Flow Research Analyst",
         goal=(
             "Analyse the attached CSV of unusual options OI/volume data for LEN "
@@ -41,95 +40,178 @@ def main():
         allow_delegation=False,
     )
 
-    # ------------------------------------------------------------------
-    # Agent 2 – Quality Reviewer
-    # ------------------------------------------------------------------
-    quality_reviewer = Agent(
+
+def _make_reviewer() -> Agent:
+    return Agent(
         role="Senior Options Flow Quality Reviewer",
         goal=(
-            "Verify the Research Analyst's report for factual correctness against the "
-            "raw CSV data. Flag any claim that is not supported or contradicted by the data."
+            "Verify the Research Analyst's report for factual accuracy against the "
+            "raw CSV data, the soundness of its logical reasoning, and the correctness "
+            "of its options concepts. Flag any unsupported, illogical, or conceptually "
+            "incorrect claims."
         ),
         backstory=(
             "You are a meticulous quality assurance specialist with deep expertise in "
-            "options market structure. Your job is to cross-reference every quantitative "
-            "and qualitative claim in a research report against the source CSV data.\n\n"
-            "You score each of the 5 sections independently:\n"
-            "  PASS  – all claims are supported by the data\n"
-            "  FLAG  – one or more claims are unsupported, exaggerated, or contradicted\n\n"
-            "You provide specific CSV row citations for each flag and an overall PASS/REVISE verdict."
+            "options market structure, derivatives pricing, and market maker mechanics.\n\n"
+            "Your job has three verification dimensions:\n"
+            "  1. Data accuracy – cross-reference every quantitative claim against the CSV\n"
+            "  2. Logic soundness – ensure conclusions follow from the evidence presented\n"
+            "  3. Concept correctness – verify that options concepts (OI, greeks, hedging,\n"
+            "     call/put dynamics, dealer positioning) are applied correctly\n\n"
+            "You score each of the 5 sections independently on all three dimensions, "
+            "providing specific CSV row citations and reasoning explanations for each flag, "
+            "plus an overall PASS / REVISE verdict."
         ),
         verbose=True,
         allow_delegation=False,
     )
 
-    # ------------------------------------------------------------------
-    # Task 1 – Research
-    # ------------------------------------------------------------------
-    research_task = Task(
-        description=(
-            f"Produce a thorough options flow analysis for LEN based on the following CSV data.\n\n"
-            f"--- CSV DATA ---\n{csv_data}\n--- END CSV ---\n\n"
-            f"Structure your report using these 5 sections exactly:\n"
-            f"1/. Key observation (big picture), stock price trend\n"
-            f"2/. Dominant recent activity (30 days), timeline of flows, support / resistance\n"
-            f"3/. What is the flow telling us — speculative bet on direction or institutional hedge?\n"
-            f"   Are big players opening long/short call/put, long/short straddle/strangle, collar?\n"
-            f"4/. Possible interpretations — explain the role, mechanism and interaction between "
-            f"   big player, dealer, market maker and retail investor.\n"
-            f"5/. Conclusion and suggested strategy with example for retail investor. "
-            f"Should they follow the big player view or do the opposite?"
-        ),
-        expected_output=(
-            "A complete 5-section options flow analysis report in plain text, "
-            "with each section clearly labelled."
-        ),
-        agent=research_analyst,
-    )
 
-    # ------------------------------------------------------------------
-    # Task 2 – Quality Review (receives research output via context)
-    # ------------------------------------------------------------------
-    review_task = Task(
-        description=(
-            "Review the Research Analyst's report for correctness against the original CSV data.\n\n"
-            f"--- REFERENCE CSV DATA ---\n{csv_data}\n--- END CSV ---\n\n"
-            "For each of the 5 sections, determine:\n"
-            "  PASS  – every claim is factually supported by the CSV\n"
-            "  FLAG  – a claim is unsubstantiated, exaggerated, or contradicted\n\n"
-            "When you FLAG a section, cite the specific CSV row(s) that contradict the claim.\n\n"
-            "Output a structured validation report with:\n"
-            "  Section 1: PASS/FLAG (evidence)\n"
-            "  Section 2: PASS/FLAG (evidence)\n"
-            "  Section 3: PASS/FLAG (evidence)\n"
-            "  Section 4: PASS/FLAG (evidence)\n"
-            "  Section 5: PASS/FLAG (evidence)\n"
-            "  -----\n"
-            "  Overall Verdict: PASS / REVISE"
-        ),
-        expected_output=(
-            "A structured validation report showing PASS/FLAG per section with "
-            "CSV row citations, plus an overall verdict."
-        ),
-        agent=quality_reviewer,
-        context=[research_task],
-    )
+class OptionsFlowAnalysis(Flow[OptionsFlowState]):
 
-    # ------------------------------------------------------------------
-    # Crew – sequential execution
-    # ------------------------------------------------------------------
-    crew = Crew(
-        agents=[research_analyst, quality_reviewer],
-        tasks=[research_task, review_task],
-        process=Process.sequential,
-        verbose=True,
-    )
+    def __init__(self, csv_data: str, framework: str, max_retries: int = MAX_RETRIES):
+        super().__init__()
+        self.csv_data = csv_data
+        self.framework = framework
+        self.max_retries = max_retries
 
-    result = crew.kickoff()
-    print("\n" + "=" * 72)
-    print("FINAL OUTPUT")
-    print("=" * 72)
-    print(result)
+    # --------------------------------------------------------------
+    # Phase 1 – initial research
+    # --------------------------------------------------------------
+    @start()
+    def research_phase(self):
+        analyst = _make_analyst(self.framework)
+        task = Task(
+            description=(
+                f"Produce a thorough options flow analysis for LEN based on the following CSV data.\n\n"
+                f"--- CSV DATA ---\n{self.csv_data}\n--- END CSV ---\n\n"
+                f"Structure your report using these 5 sections exactly:\n"
+                f"1/. Key observation (big picture), stock price trend\n"
+                f"2/. Dominant recent activity (30 days), timeline of flows, support / resistance\n"
+                f"3/. What is the flow telling us — speculative bet on direction or institutional hedge?\n"
+                f"   Are big players opening long/short call/put, long/short straddle/strangle, collar?\n"
+                f"4/. Possible interpretations — explain the role, mechanism and interaction between "
+                f"   big player, dealer, market maker and retail investor.\n"
+                f"5/. Conclusion and suggested strategy with example for retail investor. "
+                f"Should they follow the big player view or do the opposite?"
+            ),
+            expected_output=(
+                "A complete 5-section options flow analysis report in plain text, "
+                "with each section clearly labelled."
+            ),
+            agent=analyst,
+        )
+        crew = Crew(agents=[analyst], tasks=[task], verbose=True)
+        result = crew.kickoff()
+        self.state.report = result.raw
+
+    # --------------------------------------------------------------
+    # Phase 2 – quality review (triggered by initial OR revised report)
+    # --------------------------------------------------------------
+    @listen(or_("research_phase", "revise_phase"))
+    def review_phase(self):
+        reviewer = _make_reviewer()
+        feedback_hint = (
+            f"\n--- PREVIOUS FEEDBACK (verify these were fixed) ---\n"
+            f"{self.state.feedback}\n--- END ---\n"
+            if self.state.feedback
+            else ""
+        )
+        task = Task(
+            description=(
+                f"Review the Research Analyst's report for correctness.\n\n"
+                f"--- REPORT TO REVIEW ---\n{self.state.report}\n--- END ---\n\n"
+                f"--- REFERENCE CSV DATA ---\n{self.csv_data}\n--- END CSV ---\n\n"
+                f"{feedback_hint}"
+                f"For each of the 5 sections, evaluate on three dimensions:\n"
+                f"  DATA:    PASS / FLAG – are factual claims supported by the CSV?\n"
+                f"  LOGIC:   PASS / FLAG – is the reasoning coherent and sound?\n"
+                f"  CONCEPT: PASS / FLAG – are options concepts correctly applied?\n\n"
+                f"When you FLAG, cite the specific CSV row(s) and explain the issue.\n\n"
+                f"Output a structured validation report:\n"
+                f"  Section 1:  DATA=...  LOGIC=...  CONCEPT=...  (evidence)\n"
+                f"  Section 2:  DATA=...  LOGIC=...  CONCEPT=...  (evidence)\n"
+                f"  Section 3:  DATA=...  LOGIC=...  CONCEPT=...  (evidence)\n"
+                f"  Section 4:  DATA=...  LOGIC=...  CONCEPT=...  (evidence)\n"
+                f"  Section 5:  DATA=...  LOGIC=...  CONCEPT=...  (evidence)\n"
+                f"  -----\n"
+                f"  Overall Verdict: PASS / REVISE"
+            ),
+            expected_output=(
+                "A structured validation report showing DATA/LOGIC/CONCEPT verdicts "
+                "per section with evidence citations, plus an overall verdict."
+            ),
+            agent=reviewer,
+        )
+        crew = Crew(agents=[reviewer], tasks=[task], verbose=True)
+        result = crew.kickoff()
+        self.state.review = result.raw
+
+    # --------------------------------------------------------------
+    # Router – decide whether to approve or request revision
+    # --------------------------------------------------------------
+    @router(review_phase)
+    def decide(self):
+        review_text = self.state.review.upper()
+        has_flag = any(
+            m in review_text
+            for m in ["FLAG", "REVISE", "DATA_FLAG", "LOGIC_FLAG", "CONCEPT_FLAG"]
+        )
+        if has_flag and self.state.retries < self.max_retries:
+            self.state.retries += 1
+            self.state.feedback = self.state.review
+            return "revise"
+        return "approved"
+
+    # --------------------------------------------------------------
+    # Phase 3 – analyst revises report based on reviewer feedback
+    # --------------------------------------------------------------
+    @listen("revise")
+    def revise_phase(self):
+        analyst = _make_analyst(self.framework)
+        task = Task(
+            description=(
+                f"Revise your previous options flow analysis for LEN based on the "
+                f"reviewer feedback below.\n\n"
+                f"--- YOUR PREVIOUS REPORT ---\n{self.state.report}\n--- END ---\n\n"
+                f"--- REVIEWER FEEDBACK (fix every issue) ---\n{self.state.feedback}\n--- END ---\n\n"
+                f"--- REFERENCE CSV DATA ---\n{self.csv_data}\n--- END CSV ---\n\n"
+                f"Produce a corrected 5-section report addressing every flag raised above."
+            ),
+            expected_output=(
+                "A corrected 5-section options flow analysis report in plain text, "
+                "with each section clearly labelled."
+            ),
+            agent=analyst,
+        )
+        crew = Crew(agents=[analyst], tasks=[task], verbose=True)
+        result = crew.kickoff()
+        self.state.report = result.raw
+
+    # --------------------------------------------------------------
+    # Terminal – print final approved result
+    # --------------------------------------------------------------
+    @listen("approved")
+    def done(self):
+        output = (
+            f"=== APPROVED REPORT ===\n{self.state.report}\n\n"
+            f"=== FINAL REVIEW ===\n{self.state.review}"
+        )
+        print(output)
+        return output
+
+
+def main():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("ERROR: OPENAI_API_KEY environment variable not set.", file=sys.stderr)
+        sys.exit(1)
+
+    csv_data = load_text(CSV_PATH)
+    framework = load_text(MD_PATH)
+
+    flow = OptionsFlowAnalysis(csv_data=csv_data, framework=framework)
+    flow.kickoff()
 
 
 if __name__ == "__main__":
