@@ -1,16 +1,22 @@
+import argparse
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from crewai import Agent, Task, Crew, LLM
 from crewai.flow import Flow, listen, or_, start, router
 from pydantic import BaseModel
 
 
-CSV_PATH = Path(r"C:\Users\WDAGUtilityAccount\Desktop\Downloads\Options_Unusual_OI_LEN_20260624.csv")
-MD_PATH  = Path(r"C:\Users\WDAGUtilityAccount\Desktop\Downloads\OptionsFlow.md")
-MAX_RETRIES = 2
+MAX_RETRIES = 5
+
+
+def _bundled_path(name: str) -> Path:
+    """Resolve a bundled file — works both with source and PyInstaller."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / name
 
 
 def load_text(path: Path) -> str:
@@ -29,7 +35,7 @@ def _make_analyst(framework: str, llm: LLM) -> Agent:
         llm=llm,
         role="Senior Options Flow Research Analyst",
         goal=(
-            "Analyse the attached CSV of unusual options OI/volume data for LEN "
+            "Analyse the attached CSV of unusual options OI/volume data"
             "using the provided analysis framework and produce a complete 5-section report."
         ),
         backstory=(
@@ -87,10 +93,11 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # --------------------------------------------------------------
     @start()
     def research_phase(self):
+        print(f"\n--- [1/{self.max_retries + 1}] Initial research phase ---\n")
         analyst = _make_analyst(self.framework, self.analyst_llm)
         task = Task(
             description=(
-                f"Produce a thorough options flow analysis for LEN based on the following CSV data.\n\n"
+                f"Produce a thorough options flow analysis based on the following CSV data.\n\n"
                 f"--- CSV DATA ---\n{self.csv_data}\n--- END CSV ---\n\n"
                 f"Structure your report using these 5 sections exactly:\n"
                 f"1/. Key observation (big picture), stock price trend\n"
@@ -115,8 +122,9 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # --------------------------------------------------------------
     # Phase 2 – quality review (triggered by initial OR revised report)
     # --------------------------------------------------------------
-    @listen(or_("research_phase", "revise_phase"))
+    @listen(or_("research_phase", "resume_review"))
     def review_phase(self):
+        print(f"\n--- [{self.state.retries + 1}/{self.max_retries + 1}] Quality review phase ---\n")
         reviewer = _make_reviewer(self.reviewer_llm)
         feedback_hint = (
             f"\n--- PREVIOUS FEEDBACK (verify these were fixed) ---\n"
@@ -158,7 +166,7 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # Router – decide whether to approve or request revision
     # --------------------------------------------------------------
     @router(review_phase)
-    def decide(self):
+    def decide(self) -> Literal["revise", "approved"]:
         review_text = self.state.review.upper()
         has_flag = any(
             m in review_text
@@ -167,7 +175,9 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
         if has_flag and self.state.retries < self.max_retries:
             self.state.retries += 1
             self.state.feedback = self.state.review
+            print(f"\n→ Revision {self.state.retries}/{self.max_retries} needed, sending back to analyst\n")
             return "revise"
+        print(f"\n→ Report approved after {self.state.retries} revision(s)\n")
         return "approved"
 
     # --------------------------------------------------------------
@@ -175,10 +185,11 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
     # --------------------------------------------------------------
     @listen("revise")
     def revise_phase(self):
+        print(f"\n--- Revision {self.state.retries}/{self.max_retries} in progress ---\n")
         analyst = _make_analyst(self.framework, self.analyst_llm)
         task = Task(
             description=(
-                f"Revise your previous options flow analysis for LEN based on the "
+                f"Revise your previous options flow analysis based on the "
                 f"reviewer feedback below.\n\n"
                 f"--- YOUR PREVIOUS REPORT ---\n{self.state.report}\n--- END ---\n\n"
                 f"--- REVIEWER FEEDBACK (fix every issue) ---\n{self.state.feedback}\n--- END ---\n\n"
@@ -196,16 +207,36 @@ class OptionsFlowAnalysis(Flow[OptionsFlowState]):
         self.state.report = result.raw
 
     # --------------------------------------------------------------
-    # Terminal – print final approved result
+    # Router – chain back to review after revision completes
+    # --------------------------------------------------------------
+    @router("revise_phase")
+    def resume_review(self):
+        return "resume_review"
+
+    # --------------------------------------------------------------
+    # Terminal – produce final markdown
     # --------------------------------------------------------------
     @listen("approved")
     def done(self):
-        output = (
-            f"=== APPROVED REPORT ===\n{self.state.report}\n\n"
-            f"=== FINAL REVIEW ===\n{self.state.review}"
+        verdict = "PASS" if self.state.retries == 0 else f"PASS (after {self.state.retries} revision(s))"
+        md = (
+            f"# Options Flow Analysis\n\n"            
+            f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"**Analyst LLM:** {self.analyst_llm.model}\n\n"
+            f"**Reviewer LLM:** {self.reviewer_llm.model}\n\n"
+            f"**Revisions:** {self.state.retries}\n\n"
+            f"---\n\n"
+            f"## Approved Report\n\n"
+            f"{self.state.report}\n\n"
+            f"---\n\n"
+            f"## Quality Review\n\n"
+            f"{self.state.review}\n\n"
+            f"---\n\n"
+            f"## Verdict\n\n"
+            f"{verdict}\n"
         )
-        print(output)
-        return output
+        print(md)
+        return md
 
 
 def _env(key: str, fallback: str | None = None) -> str:
@@ -231,6 +262,36 @@ def _llm(model: str, api_key: str, base_url: str | None) -> LLM:
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="LEN Options Flow Analysis — CrewAI multi-agent demo"
+    )
+    parser.add_argument("csv", help="Path to the options flow CSV data file")
+    parser.add_argument(
+        "-o", "--output",
+        help="Path for the output markdown file (default: <csv_stem>_analysis_<timestamp>.md)",
+    )
+    parser.add_argument(
+        "--framework",
+        default=str(_bundled_path("OptionsFlow.md")),
+        help="Path to the analysis framework markdown file (default: bundled OptionsFlow.md)",
+    )
+    args = parser.parse_args()
+
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        print(f"ERROR: CSV file not found: {csv_path}", file=sys.stderr)
+        sys.exit(1)
+
+    framework_path = Path(args.framework)
+    if not framework_path.exists():
+        print(f"ERROR: Framework file not found: {framework_path}", file=sys.stderr)
+        sys.exit(1)
+
+    output_path = args.output
+    if not output_path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = str(csv_path.with_name(f"{csv_path.stem}_analysis_{ts}.md"))
+
     # ---- per-agent model config with fallback chain ----
     analyst_model = os.getenv("ANALYST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
     analyst_key   = os.getenv("ANALYST_API_KEY") or _env("OPENAI_API_KEY")
@@ -243,8 +304,8 @@ def main():
     analyst_llm  = _llm(analyst_model, analyst_key, analyst_base)
     reviewer_llm = _llm(reviewer_model, reviewer_key, reviewer_base)
 
-    csv_data = load_text(CSV_PATH)
-    framework = load_text(MD_PATH)
+    csv_data = load_text(csv_path)
+    framework = load_text(framework_path)
 
     flow = OptionsFlowAnalysis(
         csv_data=csv_data,
@@ -252,7 +313,14 @@ def main():
         analyst_llm=analyst_llm,
         reviewer_llm=reviewer_llm,
     )
-    flow.kickoff()
+    result = flow.kickoff()
+
+    if result is None:
+        print("ERROR: Flow completed without producing a result.", file=sys.stderr)
+        sys.exit(1)
+
+    Path(output_path).write_text(result, encoding="utf-8")
+    print(f"\nAnalysis saved to: {output_path}")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,33 @@ If per-agent vars are not set, these serve as the fallback.
 
 ## Usage
 
+```
+usage: len-options-flow.exe [-h] [-o OUTPUT] [--framework FRAMEWORK] csv
+
+positional arguments:
+  csv                   Path to the options flow CSV data file
+
+options:
+  -h, --help            show this help message and exit
+  -o OUTPUT, --output OUTPUT
+                        Path for the output markdown file (default: <csv_stem>_analysis_<timestamp>.md)
+  --framework FRAMEWORK
+                        Path to the analysis framework markdown file (default: bundled OptionsFlow.md)
+```
+
+### With virtual environment (source)
+
+```powershell
+$env:OPENAI_API_KEY="sk-..."
+& "C:\Users\WDAGUtilityAccount\crewai-env\Scripts\python.exe" crewai_demo.py data.csv -o report.md
+```
+
+### With standalone exe
+
+```powershell
+len-options-flow.exe data.csv -o report.md
+```
+
 ### Different models and keys for each agent
 
 ```powershell
@@ -58,14 +85,7 @@ $env:ANALYST_MODEL="gpt-4o"
 $env:ANALYST_API_KEY="sk-analyst-key..."
 $env:REVIEWER_MODEL="anthropic/claude-sonnet-4-20250514"
 $env:REVIEWER_API_KEY="sk-reviewer-key..."
-& "C:\Users\WDAGUtilityAccount\crewai-env\Scripts\python.exe" crewai_demo.py
-```
-
-### Same model, single API key (simple)
-
-```powershell
-$env:OPENAI_API_KEY="sk-..."
-& "C:\Users\WDAGUtilityAccount\crewai-env\Scripts\python.exe" crewai_demo.py
+len-options-flow.exe data.csv
 ```
 
 ### Custom providers (via LiteLLM)
@@ -79,12 +99,48 @@ $env:REVIEWER_API_KEY="sk-..."
 
 ## Input Files
 
-The script reads two files at startup (paths are currently hardcoded):
+The script reads the CSV from the path provided on the command line and the analysis framework from the bundled `OptionsFlow.md` (or a custom path via `--framework`).
 
-| File | Content |
-|---|---|
-| `Options_Unusual_OI_LEN_20260624.csv` | Unusual options OI / volume data for LEN |
-| `OptionsFlow.md` | Analysis framework (5-section methodology) |
+## Output
+
+The final result is saved as a structured markdown file containing:
+
+- **Approved Report** — the 5-section analysis (possibly revised after review flags)
+- **Quality Review** — per-section DATA / LOGIC / CONCEPT verdicts with evidence
+- **Verdict** — PASS or PASS (after N revisions)
+
+The output is also printed to stdout for immediate inspection.
+
+## Building the standalone exe
+
+```powershell
+# Requires PyInstaller (install in your CrewAI venv)
+C:\Users\WDAGUtilityAccount\crewai-env\Scripts\python.exe -m pip install pyinstaller
+
+# Build with --onedir (recommended) for reliability
+C:\Users\WDAGUtilityAccount\crewai-env\Scripts\python.exe -m PyInstaller --noconfirm --onedir --console ^
+    --name len-options-flow ^
+    --add-data "OptionsFlow.md;." ^
+    --hidden-import crewai ^
+    --hidden-import crewai.flow ^
+    --hidden-import pydantic ^
+    --hidden-import httpx ^
+    --hidden-import openai ^
+    --hidden-import chromadb ^
+    --hidden-import tokenizers ^
+    --hidden-import tiktoken ^
+    --collect-all pydantic ^
+    --collect-all crewai ^
+    --collect-all chromadb ^
+    crewai_demo.py
+
+# Run from the output folder
+dist\len-options-flow\len-options-flow.exe data.csv -o report.md
+```
+
+Or simply run `build.bat` (included in the repo).
+
+> **Note:** The folder at `dist\len-options-flow\` is self-contained. Zip it for distribution — no installation required on the target machine. Total size is ~430 MB due to bundled Python runtime, ChromaDB, ONNX runtime, and CrewAI.
 
 ## Report Sections
 
